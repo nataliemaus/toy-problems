@@ -15,7 +15,7 @@ class RoverObjective(Objective):
     def __init__(
         self,
         input_dim=60,
-        output_dim=1_000,
+        output_dim=2_000,
         num_calls=0,
         f_max=5.0, # default 
         **kwargs,
@@ -82,17 +82,27 @@ class RoverObjective(Objective):
 
 
 if __name__ == "__main__":
-    input_dim = 10 # must be divisible by 2 
-    output_dim = 100 # must be divisible by 2 
+    input_dim = 60 # must be divisible by 2 
+    output_dim = 2000 # must be divisible by 2 
     bsz = 10
     objective = RoverObjective(
         input_dim=input_dim,
         output_dim=output_dim,
-    )
+    ) 
 
     xs = torch.randn(bsz,input_dim)
     # scores = objective(xs)
 
     ys = objective.xs_to_ys(xs)  # tensor (bsz, output_dim)
     scores = objective.ys_to_scores(ys) # tensor (bsz, 1)
+
+    for i in range(len(xs)):
+        points0 = objective.policy_to_trajectory(xs[i])
+        score0 = objective.trajectory_to_reward(points0)
+        print("score is", scores[i].item(), "and should be", score0)
+
+
+
+    import pdb 
+    pdb.set_trace() 
 

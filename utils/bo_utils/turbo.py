@@ -2,10 +2,12 @@ import math
 import torch
 from dataclasses import dataclass
 from torch.quasirandom import SobolEngine
-# from botorch.acquisition import qExpectedImprovement
-# from botorch.optim import optimize_acqf 
+from botorch.acquisition import qExpectedImprovement
+from botorch.optim import optimize_acqf 
 from .approximate_gp import *
-from .multiple_output_max_posterior_sampling import MaxPosteriorSampling
+from .multiple_output_max_posterior_sampling import MaxPosteriorSampling as MultiMaxPosteriorSampling
+from .constrained_max_posterior_sampling import MaxPosteriorSampling as CMaxPosteriorSampling
+from botorch.generation import MaxPosteriorSampling 
 
 @dataclass
 class TurboState:
@@ -135,7 +137,7 @@ def update_state_unconstrained(state, Y_next):
     return state
 
 
-def generate_batch(
+def generate_batch_intermediate_output(
     state,
     models_list,  # GP model
     objective,
@@ -166,16 +168,10 @@ def generate_batch(
         tr_lb = x_center - weights * state.length / 2.0
         tr_ub = x_center + weights * state.length / 2.0 
     else:
-        ub, lb = absolute_bounds
+        lb, ub = absolute_bounds
+        weights = weights * (ub - lb)
         tr_lb = torch.clamp(x_center - weights * state.length / 2.0, lb, ub) 
         tr_ub = torch.clamp(x_center + weights * state.length / 2.0, lb, ub) 
-
-    # if acqf == "ei":
-    #     try:
-    #         ei = qExpectedImprovement(model.cuda(), Y.max().cuda() ) 
-    #         X_next, _ = optimize_acqf(ei,bounds=torch.stack([tr_lb, tr_ub]).cuda(),q=batch_size, num_restarts=num_restarts,raw_samples=raw_samples,)
-    #     except: 
-    #         acqf = 'ts'
 
     if acqf == "ts":
         dim = X.shape[-1]
@@ -199,7 +195,7 @@ def generate_batch(
         X_cand[mask] = pert[mask]
 
         # Sample candidates according to models of intermediate outputs 
-        thompson_sampling = MaxPosteriorSampling(
+        thompson_sampling = MultiMaxPosteriorSampling(
             models_list=models_list,
             replacement=False,
         ) 
@@ -212,3 +208,86 @@ def generate_batch(
 
     return X_next
 
+
+def generate_batch(
+    state,
+    model,  # GP model
+    X,  # Evaluated points on the domain [0, 1]^d
+    Y,  # Function values
+    batch_size,
+    n_candidates=None,  # Number of candidates for Thompson sampling 
+    num_restarts=10,
+    raw_samples=256,
+    acqf="ts",  # "ei" or "ts"
+    dtype=torch.float32,
+    device=torch.device('cuda'),
+    absolute_bounds=None, 
+    constraint_model_list=None,
+):
+    assert acqf in ("ts", "ei")
+    if constraint_model_list is not None:
+        assert acqf == "ts" # SCBO only works with ts
+        constrained=True
+    else:
+        constrained=False
+    assert torch.all(torch.isfinite(Y))
+    if n_candidates is None: n_candidates = min(5000, max(2000, 200 * X.shape[-1]))
+
+    x_center = X[Y.argmax(), :].clone()  
+    weights = torch.ones_like(x_center)
+    
+    if absolute_bounds is None:
+        weights = weights * 8
+        tr_lb = x_center - weights * state.length / 2.0
+        tr_ub = x_center + weights * state.length / 2.0 
+    else:
+        lb, ub = absolute_bounds
+        weights = weights * (ub - lb)
+        tr_lb = torch.clamp(x_center - weights * state.length / 2.0, lb, ub) 
+        tr_ub = torch.clamp(x_center + weights * state.length / 2.0, lb, ub) 
+    if acqf == "ei":
+        try:
+            ei = qExpectedImprovement(model.cuda(), Y.max().cuda() ) 
+            X_next, _ = optimize_acqf(ei,bounds=torch.stack([tr_lb, tr_ub]).cuda(),q=batch_size, num_restarts=num_restarts,raw_samples=raw_samples,)
+        except: 
+            acqf = 'ts'
+
+    if acqf == "ts":
+        dim = X.shape[-1]
+        tr_lb = tr_lb.cuda()
+        tr_ub = tr_ub.cuda() 
+        sobol = SobolEngine(dim, scramble=True) 
+        pert = sobol.draw(n_candidates).to(dtype=dtype).cuda()
+        pert = tr_lb + (tr_ub - tr_lb) * pert
+        tr_lb = tr_lb.cuda()
+        tr_ub = tr_ub.cuda() 
+        # Create a perturbation mask 
+        prob_perturb = min(20.0 / dim, 1.0)
+        mask = (torch.rand(n_candidates, dim, dtype=dtype, device=device)<= prob_perturb)
+        ind = torch.where(mask.sum(dim=1) == 0)[0]
+        mask[ind, torch.randint(0, dim - 1, size=(len(ind),), device=device)] = 1
+        mask = mask.cuda()
+        # Create candidate points from the perturbations and the mask
+        X_cand = x_center.expand(n_candidates, dim).clone()
+        X_cand = X_cand.cuda()
+        X_cand[mask] = pert[mask]
+
+        # Sample on the candidate points 
+        assert not constrained
+        thompson_sampling = MaxPosteriorSampling(model=model, replacement=False ) 
+        with torch.no_grad():
+            X_next = thompson_sampling(X_cand.cuda(), num_samples=batch_size )
+
+    return X_next 
+    #     # Sample on the candidate points 
+    #     # SCBO --> Sample on the candidate points using Constrained Max Posterior Sampling
+    #     thompson_sampling = CMaxPosteriorSampling(
+    #         model=model,
+    #         constraint_models=constraint_model_list,
+    #         replacement=False,
+    #         constrained=constrained,
+    #     ) 
+    #     with torch.no_grad():
+    #         X_next = thompson_sampling(X_cand.cuda(), num_samples=batch_size )
+
+    # return X_next 

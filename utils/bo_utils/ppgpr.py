@@ -43,11 +43,11 @@ class GPModel(ApproximateGP):
 
 # gp model with deep kernel 
 class GPModelDKL(ApproximateGP):
-    def __init__(self, inducing_points, likelihood, hidden_dims=(256, 256) ):
+    def __init__(self, inducing_points, likelihood, hidden_dims=(32, 32) ):
         feature_extractor = DenseNetwork(
             input_dim=inducing_points.size(-1),
             hidden_dims=hidden_dims).to(inducing_points.device
-            )
+        )
         inducing_points = feature_extractor(inducing_points)
         variational_distribution = CholeskyVariationalDistribution(inducing_points.size(0))
         variational_strategy = VariationalStrategy(
@@ -55,7 +55,7 @@ class GPModelDKL(ApproximateGP):
             inducing_points,
             variational_distribution,
             learn_inducing_locations=True
-            )
+        )
         super(GPModelDKL, self).__init__(variational_strategy)
         self.mean_module = gpytorch.means.ConstantMean()
         self.covar_module = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel())
@@ -81,3 +81,4 @@ class GPModelDKL(ApproximateGP):
             dist = self.likelihood(self(X))
 
             return GPyTorchPosterior(mvn=dist)
+

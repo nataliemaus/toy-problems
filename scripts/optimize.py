@@ -12,8 +12,13 @@ import os
 os.environ["WANDB_SILENT"] = "True"
 import signal 
 import gpytorch 
-from utils.bo_utils.turbo import TurboState, update_state_unconstrained, generate_batch
-from utils.utils import update_surrogate_models
+from utils.bo_utils.turbo import (
+    TurboState, 
+    update_state_unconstrained, 
+    generate_batch,
+    generate_batch_intermediate_output,
+)
+from utils.utils import update_surrogate_models, update_surr_model
 from utils.bo_utils.ppgpr import GPModelDKL
 from gpytorch.mlls import PredictiveLogLikelihood 
 from tasks.rover.rover_objective import RoverObjective
@@ -46,6 +51,7 @@ class Optimize(object):
         input_dim: dim of search space for optimization task 
         output_dim: dim of intermediate output space we want to model with GPs
         gp_hidden_dims: tuple giving hidden dims for GP Deep Kernel, if None will be (input_dim, input_dim) by default
+        model_intermeidate_output: boolean, if True we use multiple GP models to predict the intermediate output values
     """
     def __init__(
         self,
@@ -66,6 +72,8 @@ class Optimize(object):
         input_dim: int=60,
         output_dim: int=20,
         gp_hidden_dims: tuple=None,
+        model_intermeidate_output: bool=False,
+        max_lookback: int=1_000, # max N train data points to update on each iteration 
     ):
         # add all local args to method args dict to be logged by wandb
         signal.signal(signal.SIGINT, self.handler)
@@ -88,9 +96,11 @@ class Optimize(object):
         self.initial_model_training_complete = False
         self.learning_rte = learning_rte
         if gp_hidden_dims is None:
-            gp_hidden_dims = (self.input_dim, self.input_dim)
+            gp_hidden_dims = (self.input_dim // 2, self.input_dim // 2)
         self.gp_hidden_dims = gp_hidden_dims
         self.acq_func = acq_func
+        self.model_intermeidate_output = model_intermeidate_output
+        self.max_lookback = max_lookback
         
         self.set_seed()
         if wandb_project_name: # if project name specified
@@ -266,24 +276,44 @@ class Optimize(object):
 
     def initialize_surrogate_model(self ):
         n_pts = min(self.train_x.shape[0], 1024) 
-        self.models_list = []
-        self.mlls_list = []
-        for _ in range(self.output_dim):
+        if self.model_intermeidate_output:
+            self.model = None
+            self.mll = None 
+            self.models_list = []
+            self.mlls_list = []
+            for _ in range(self.output_dim):
+                likelihood = gpytorch.likelihoods.GaussianLikelihood().cuda() 
+                model = GPModelDKL(
+                    self.train_x[:n_pts, :].cuda(), 
+                    likelihood=likelihood,
+                    hidden_dims=self.gp_hidden_dims, 
+                ).cuda() 
+                mll = PredictiveLogLikelihood(
+                    model.likelihood, 
+                    model, 
+                    num_data=self.train_x.size(-2)
+                )
+                model = model.eval() 
+                model = model.cuda() 
+                self.models_list.append(model)
+                self.mlls_list.append(mll)
+        else:
+            self.models_list = None
+            self.mlls_list = None 
             likelihood = gpytorch.likelihoods.GaussianLikelihood().cuda() 
-            model = GPModelDKL(
+            self.model = GPModelDKL(
                 self.train_x[:n_pts, :].cuda(), 
                 likelihood=likelihood,
                 hidden_dims=self.gp_hidden_dims, 
             ).cuda() 
-            mll = PredictiveLogLikelihood(
-                model.likelihood, 
-                model, 
+            self.mll = PredictiveLogLikelihood(
+                self.model.likelihood, 
+                self.model, 
                 num_data=self.train_x.size(-2)
-            )
-            model = model.eval() 
-            model = model.cuda() 
-            self.models_list.append(model)
-            self.mlls_list.append(mll)
+            ) 
+            self.model = self.model.eval() 
+            self.model = self.model.cuda() 
+            
         return self 
 
 
@@ -292,21 +322,35 @@ class Optimize(object):
             # first time training surr model --> train on all data
             n_epochs = self.init_n_epochs
             X = self.train_x
-            Y = self.train_y.squeeze(-1)
+            Y = self.train_y 
+            S = self.train_scores.squeeze(-1)
         else:
             # otherwise, only train on most recent batch of data
+            lookback = min(self.max_lookback, len(self.train_x))
+            lookback = max(lookback, self.bsz)
             n_epochs = self.num_update_epochs
-            X = self.train_x[-self.bsz:]
-            Y = self.train_y[-self.bsz:].squeeze(-1)
-            
-        self.models_list = update_surrogate_models(
-            models_list=self.models_list,
-            mlls_list=self.mlls_list,
-            learning_rte=self.learning_rte,
-            train_x=X,
-            train_y=Y,
-            n_epochs=n_epochs,
-        )
+            X = self.train_x[-lookback:]
+            Y = self.train_y[-lookback:] 
+            S = self.train_scores[-lookback:].squeeze(-1)
+
+        if self.model_intermeidate_output: 
+            self.models_list = update_surrogate_models(
+                models_list=self.models_list,
+                mlls_list=self.mlls_list,
+                learning_rte=self.learning_rte,
+                train_x=X,
+                train_y=Y,
+                n_epochs=n_epochs,
+            ) 
+        else:
+            self.model = update_surr_model(
+                model=self.model,
+                mll=self.mll,
+                learning_rte=self.learning_rte,
+                train_x=X,
+                train_y=S,
+                n_epochs=n_epochs,
+            )
         
         self.initial_model_training_complete = True
         return self 
@@ -333,7 +377,7 @@ class Optimize(object):
                 batch_size=self.bsz, 
             )
         return self 
-    
+
 
     def acquisition(self):   
         '''Generate new candidate points,
@@ -343,17 +387,28 @@ class Optimize(object):
             absolute_bounds = None 
         else:
             absolute_bounds=(self.objective.lb, self.objective.ub)
-        x_next = generate_batch(
-            state=self.tr_state,
-            models_list=self.models_list,
-            objective=self.objective,
-            X=self.train_x,
-            Y=self.train_y,
-            S=self.train_scores,
-            batch_size=self.bsz, 
-            acqf=self.acq_func,
-            absolute_bounds=absolute_bounds,
-        ) 
+        if self.model_intermeidate_output: 
+            x_next = generate_batch_intermediate_output(
+                state=self.tr_state,
+                models_list=self.models_list,
+                objective=self.objective,
+                X=self.train_x,
+                Y=self.train_y,
+                S=self.train_scores,
+                batch_size=self.bsz, 
+                acqf=self.acq_func,
+                absolute_bounds=absolute_bounds,
+            ) 
+        else:
+            x_next = generate_batch(
+                state=self.tr_state,
+                model=self.model, # GP model
+                X=self.train_x,  # Evaluated points on the domain [0, 1]^d
+                Y=self.train_scores,  # Function values
+                batch_size=self.bsz,
+                acqf=self.acq_func,  # "ei" or "ts"
+                absolute_bounds=absolute_bounds, 
+            )
         if len(x_next.shape) == 1:
             x_next = x_next.unsqueeze(0)
         y_next = self.objective.xs_to_ys(x_next) 
